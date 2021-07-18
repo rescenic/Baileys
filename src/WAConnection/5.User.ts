@@ -1,5 +1,5 @@
 import {WAConnection as Base} from './4.Events'
-import { Presence, WABroadcastListInfo, WAProfilePictureChange, WALoadChatOptions, WAChatIndex, BlocklistUpdate } from './Constants'
+import { Presence, WABroadcastListInfo, WAProfilePictureChange, WALoadChatOptions, WAChatIndex, BlocklistUpdate, WABusinessProfile } from './Constants'
 import {
     WAMessage,
     WANode,
@@ -19,32 +19,8 @@ export class WAConnection extends Base {
      * @returns undefined if the number doesn't exists, otherwise the correctly formatted jid
      */
     isOnWhatsApp = async (str: string) => {
-        if (this.state !== 'open') {
-            return this.isOnWhatsAppNoConn(str)
-        }
         const { status, jid, biz } = await this.query({json: ['query', 'exist', str], requiresPhoneConnection: false})
         if (status === 200) return { exists: true, jid: whatsappID(jid), isBusiness: biz as boolean}
-    }
-    /** 
-     * Query whether a given number is registered on WhatsApp, without needing to open a WS connection
-     * @param str phone number/jid you want to check for
-     * @returns undefined if the number doesn't exists, otherwise the correctly formatted jid
-     */
-    isOnWhatsAppNoConn = async (str: string) => {
-        let phone = str.split('@')[0]
-        const url = `https://wa.me/${phone}`
-        const response = await this.fetchRequest(url, 'GET', undefined, undefined, undefined, false)
-        const loc = response.headers.location as string
-        if (!loc) {
-            this.logger.warn({ url, status: response.statusCode }, 'did not get location from request')
-            return
-        }
-        const locUrl = new URL('', loc)
-        if (!locUrl.pathname.endsWith('send/')) {
-            return
-        }
-        phone = locUrl.searchParams.get('phone')
-        return { exists: true, jid: `${phone}@s.whatsapp.net` } 
     }
     /**
      * Tell someone about your presence -- online, typing, offline etc.
@@ -79,6 +55,21 @@ export class WAConnection extends Base {
         )
         this.emit ('contact-update', { jid: this.user.jid, status })
         return response
+    }
+    /** Updates business profile. */
+    async updateBusinessProfile(profile: WABusinessProfile) {
+        if (profile.business_hours?.config) {
+            profile.business_hours.business_config = profile.business_hours.config
+            delete profile.business_hours.config
+        }
+        const json = ['action', "editBusinessProfile", {...profile, v: 2}]
+        let response;
+        try {
+            response = await this.query({ json, expect200: true, requiresPhoneConnection: true })
+        } catch (_) {
+            return {status: 400}
+        } 
+        return { status: response.status }
     }
     async updateProfileName (name: string) {
         const response = (await this.setQuery (
@@ -214,7 +205,7 @@ export class WAConnection extends Base {
     /**
      * Query Business Profile (Useful for VCards)
      * @param jid Business Jid
-     * @returns profile object or undefined if not business account
+     * @returns {WABusinessProfile} profile object or undefined if not business account
      */
     async getBusinessProfile(jid: string) {
         jid = whatsappID(jid)
@@ -233,8 +224,8 @@ export class WAConnection extends Base {
             requiresPhoneConnection: false,
         })
         return {
-            profile,
-            jid: whatsappID(wid),
+            ...profile,
+            wid: whatsappID(wid)
         }
     }
 }

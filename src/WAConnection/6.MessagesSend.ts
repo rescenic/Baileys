@@ -9,6 +9,9 @@ import {
     WALocationMessage,
     WAContactMessage,
     WAContactsArrayMessage,
+    WAGroupInviteMessage,
+    WAListMessage,
+    WAButtonsMessage,
     WATextMessage,
     WAMessageContent, WAMetric, WAFlag, WAMessage, BaileysError, WA_MESSAGE_STATUS_TYPE, WAMessageProto, MediaConnInfo, MessageTypeProto, URL_REGEX, WAUrlInfo, WA_DEFAULT_EPHEMERAL, WAMediaUpload
 } from './Constants'
@@ -26,7 +29,7 @@ export class WAConnection extends Base {
      */
     async sendMessage(
         id: string,
-        message: string | WATextMessage | WALocationMessage | WAContactMessage | WAContactsArrayMessage | WAMediaUpload,
+        message: string | WATextMessage | WALocationMessage | WAContactMessage | WAContactsArrayMessage | WAGroupInviteMessage | WAMediaUpload | WAListMessage | WAButtonsMessage,
         type: MessageType,
         options: MessageOptions = {},
     ) {
@@ -34,10 +37,38 @@ export class WAConnection extends Base {
         await this.relayWAMessage (waMessage, { waitForAck: options.waitForAck !== false })
         return waMessage
     }
+    /**
+     * Send a list message
+     * @param id the id to send to
+     * @param button the optional button text, title and description button
+     * @param rows the rows of sections list message
+     */
+    async sendListMessage(
+        id: string,
+        button: { buttonText?: string; description?: string; title?: string },
+        rows: any = [],
+    ) {
+        let messageList = WAMessageProto.Message.fromObject({
+            listMessage: WAMessageProto.ListMessage.fromObject({
+                buttonText: button.buttonText,
+                description: button.description,
+                listType: 1,
+                sections: [
+                    {
+                        title: button.title,
+                        rows: [ ...rows ]
+                    }
+                ]
+            })
+        })
+        let waMessageList = await this.prepareMessageFromContent(id, messageList, {})
+        await this.relayWAMessage (waMessageList, { waitForAck: true })
+        return waMessageList
+    }
     /** Prepares a message for sending via sendWAMessage () */
     async prepareMessage(
         id: string,
-        message: string | WATextMessage | WALocationMessage | WAContactMessage | WAContactsArrayMessage | WAMediaUpload,
+        message: string | WATextMessage | WALocationMessage | WAContactMessage | WAContactsArrayMessage | WAGroupInviteMessage | WAMediaUpload | WAListMessage | WAButtonsMessage,
         type: MessageType,
         options: MessageOptions = {},
     ) {
@@ -76,7 +107,7 @@ export class WAConnection extends Base {
         }
     }
     /** Prepares the message content */
-    async prepareMessageContent (message: string | WATextMessage | WALocationMessage | WAContactMessage | WAContactsArrayMessage | WAMediaUpload, type: MessageType, options: MessageOptions) {
+    async prepareMessageContent (message: string | WATextMessage | WALocationMessage | WAContactMessage | WAContactsArrayMessage | WAGroupInviteMessage | WAMediaUpload | WAListMessage | WAButtonsMessage, type: MessageType, options: MessageOptions) {
         let m: WAMessageContent = {}
         switch (type) {
             case MessageType.text:
@@ -105,6 +136,15 @@ export class WAConnection extends Base {
                 break
             case MessageType.contactsArray:
                 m.contactsArrayMessage = WAMessageProto.ContactsArrayMessage.fromObject(message as any)
+                break
+            case MessageType.groupInviteMessage:
+                m.groupInviteMessage = WAMessageProto.GroupInviteMessage.fromObject(message as any)
+                break
+            case MessageType.listMessage:
+                m.listMessage = WAMessageProto.ListMessage.fromObject(message as any)
+                break
+            case MessageType.buttonsMessage:
+                m.buttonsMessage = WAMessageProto.ButtonsMessage.fromObject(message as any)
                 break
             case MessageType.image:
             case MessageType.sticker:
@@ -137,6 +177,9 @@ export class WAConnection extends Base {
         }
         if (mediaType === MessageType.sticker && options.caption) {
             throw new Error('cannot send a caption with a sticker')
+        }
+        if (!(mediaType === MessageType.image || mediaType === MessageType.video) && options.viewOnce) {
+            throw new Error(`cannot send a ${mediaType} as a viewOnceMessage`)
         }
         if (!options.mimetype) {
             options.mimetype = MimetypeMap[mediaType]
@@ -227,7 +270,8 @@ export class WAConnection extends Base {
                     fileName: options.filename || 'file',
                     gifPlayback: isGIF || undefined,
                     caption: options.caption,
-                    ptt: options.ptt
+                    ptt: options.ptt,
+                    viewOnce: options.viewOnce
                 }
             )
         }
@@ -237,6 +281,7 @@ export class WAConnection extends Base {
     prepareMessageFromContent(id: string, message: WAMessageContent, options: MessageOptions) {
         if (!options.timestamp) options.timestamp = new Date() // set timestamp to now
         if (typeof options.sendEphemeral === 'undefined') options.sendEphemeral = 'chat'
+        if (options.viewOnce) message = { viewOnceMessage: { message } }
         // prevent an annoying bug (WA doesn't accept sending messages with '@c.us')
         id = whatsappID (id)
 
