@@ -1,153 +1,187 @@
-import {
-    WAConnection,
-    MessageType,
-    Presence,
-    MessageOptions,
-    Mimetype,
-    WALocationMessage,
-    WA_MESSAGE_STUB_TYPES,
-    ReconnectMode,
-    ProxyAgent,
-    waChatKey,
-} from '../src/WAConnection'
-import * as fs from 'fs'
+import { Boom } from '@hapi/boom'
+import NodeCache from 'node-cache'
+import makeWASocket, { AnyMessageContent, delay, DisconnectReason, fetchLatestBaileysVersion, getAggregateVotesInPollMessage, makeCacheableSignalKeyStore, makeInMemoryStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
+import MAIN_LOGGER from '../src/Utils/logger'
 
-async function example() {
-    const conn = new WAConnection() // instantiate
-    conn.autoReconnect = ReconnectMode.onConnectionLost // only automatically reconnect when the connection breaks
-    conn.logger.level = 'debug' // set to 'debug' to see what kind of stuff you can implement
-    // attempt to reconnect at most 10 times in a row
-    conn.connectOptions.maxRetries = 10
-    conn.chatOrderingKey = waChatKey(true) // order chats such that pinned chats are on top
-    conn.on('chats-received', ({ hasNewChats }) => {
-        console.log(`you have ${conn.chats.length} chats, new chats available: ${hasNewChats}`)
-    })
-    conn.on('contacts-received', () => {
-        console.log(`you have ${Object.keys(conn.contacts).length} contacts`)
-    })
-    conn.on('initial-data-received', () => {
-        console.log('received all initial messages')
-    })
+const logger = MAIN_LOGGER.child({ })
+logger.level = 'trace'
 
-    // loads the auth file credentials if present
-    /*  Note: one can take this auth_info.json file and login again from any computer without having to scan the QR code, 
-        and get full access to one's WhatsApp. Despite the convenience, be careful with this file */
-    fs.existsSync('./auth_info.json') && conn.loadAuthInfo ('./auth_info.json')
-    // uncomment the following line to proxy the connection; some random proxy I got off of: https://proxyscrape.com/free-proxy-list
-    //conn.connectOptions.agent = ProxyAgent ('http://1.0.180.120:8080')
-    await conn.connect()
-    // credentials are updated on every connect
-    const authInfo = conn.base64EncodedAuthInfo() // get all the auth info we need to restore this session
-    fs.writeFileSync('./auth_info.json', JSON.stringify(authInfo, null, '\t')) // save this info to a file
+const useStore = !process.argv.includes('--no-store')
+const doReplies = !process.argv.includes('--no-reply')
 
-    console.log('oh hello ' + conn.user.name + ' (' + conn.user.jid + ')')    
-    // uncomment to load all unread messages
-    //const unread = await conn.loadAllUnreadMessages ()
-    //console.log ('you have ' + unread.length + ' unread messages')
+// external map to store retry counts of messages when decryption/encryption fails
+// keep this out of the socket itself, so as to prevent a message decryption/encryption loop across socket restarts
+const msgRetryCounterCache = new NodeCache()
 
-    /**
-     * The universal event for anything that happens
-     * New messages, updated messages, read & delivered messages, participants typing etc.
-     */
-    conn.on('chat-update', async chat => {
-        if (chat.presences) { // receive presence updates -- composing, available, etc.
-            Object.values(chat.presences).forEach(presence => console.log( `${presence.name}'s presence is ${presence.lastKnownPresence} in ${chat.jid}`))
-        }
-        if(chat.imgUrl) {
-            console.log('imgUrl of chat changed ', chat.imgUrl)
-            return
-        }
-        // only do something when a new message is received
-        if (!chat.hasNewMessage) {
-            if(chat.messages) {
-                console.log('updated message: ', chat.messages.first)
-            }
-            return
-        } 
-        
-        const m = chat.messages.all()[0] // pull the new message from the update
-        const messageStubType = WA_MESSAGE_STUB_TYPES[m.messageStubType] ||  'MESSAGE'
-        console.log('got notification of type: ' + messageStubType)
+// the store maintains the data of the WA connection in memory
+// can be written out to a file & read from it
+const store = useStore ? makeInMemoryStore({ logger }) : undefined
+store?.readFromFile('./baileys_store_multi.json')
+// save every 10s
+setInterval(() => {
+	store?.writeToFile('./baileys_store_multi.json')
+}, 10_000)
 
-        const messageContent = m.message
-        // if it is not a regular text or media message
-        if (!messageContent) return
-        
-        if (m.key.fromMe) {
-            console.log('relayed my own message')
-            return
-        }
+// start a connection
+const startSock = async() => {
+	const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info')
+	// fetch latest version of WA Web
+	const { version, isLatest } = await fetchLatestBaileysVersion()
+	console.log(`using WA v${version.join('.')}, isLatest: ${isLatest}`)
 
-        let sender = m.key.remoteJid
-        if (m.key.participant) {
-            // participant exists if the message is in a group
-            sender += ' (' + m.key.participant + ')'
-        }
-        const messageType = Object.keys (messageContent)[0] // message will always contain one key signifying what kind of message
-        if (messageType === MessageType.text) {
-            const text = m.message.conversation
-            console.log(sender + ' sent: ' + text)
-        } else if (messageType === MessageType.extendedText) {
-            const text = m.message.extendedTextMessage.text
-            console.log(sender + ' sent: ' + text + ' and quoted message: ' + JSON.stringify(m.message))
-        } else if (messageType === MessageType.contact) {
-            const contact = m.message.contactMessage
-            console.log(sender + ' sent contact (' + contact.displayName + '): ' + contact.vcard)
-        } else if (messageType === MessageType.location || messageType === MessageType.liveLocation) {
-            const locMessage = m.message[messageType] as WALocationMessage
-            console.log(`${sender} sent location (lat: ${locMessage.degreesLatitude}, long: ${locMessage.degreesLongitude})`)
-            
-            await conn.downloadAndSaveMediaMessage(m, './Media/media_loc_thumb_in_' + m.key.id) // save location thumbnail
+	const sock = makeWASocket({
+		version,
+		logger,
+		printQRInTerminal: true,
+		auth: {
+			creds: state.creds,
+			/** caching makes the store faster to send/recv messages */
+			keys: makeCacheableSignalKeyStore(state.keys, logger),
+		},
+		msgRetryCounterCache,
+		generateHighQualityLinkPreview: true,
+		// ignore all broadcast messages -- to receive the same
+		// comment the line below out
+		// shouldIgnoreJid: jid => isJidBroadcast(jid),
+		// implement to handle retries & poll updates
+		getMessage,
+	})
 
-            if (messageType === MessageType.liveLocation) {
-                console.log(`${sender} sent live location for duration: ${m.duration/60}`)
-            }
-        } else {
-            // if it is a media (audio, image, video, sticker) message
-            // decode, decrypt & save the media.
-            // The extension to the is applied automatically based on the media type
-            try {
-                const savedFile = await conn.downloadAndSaveMediaMessage(m, './Media/media_in_' + m.key.id)
-                console.log(sender + ' sent media, saved at: ' + savedFile)
-            } catch (err) {
-                console.log('error in decoding message: ' + err)
-            }
-        }
-        // send a reply after 3 seconds
-        setTimeout(async () => {
-            await conn.chatRead(m.key.remoteJid) // mark chat read
-            await conn.updatePresence(m.key.remoteJid, Presence.available) // tell them we're available
-            await conn.updatePresence(m.key.remoteJid, Presence.composing) // tell them we're composing
+	store?.bind(sock.ev)
 
-            const options: MessageOptions = { quoted: m }
-            let content
-            let type: MessageType
-            const rand = Math.random()
-            if (rand > 0.66) { // choose at random
-                content = 'hello!' // send a "hello!" & quote the message recieved
-                type = MessageType.text
-            } else if (rand > 0.33) { // choose at random
-                content = { degreesLatitude: 32.123123, degreesLongitude: 12.12123123 }
-                type = MessageType.location
-            } else {
-                content = fs.readFileSync('./Media/ma_gif.mp4') // load the gif
-                options.mimetype = Mimetype.gif
-                type = MessageType.video
-            }
-            const response = await conn.sendMessage(m.key.remoteJid, content, type, options)
-            console.log("sent message with ID '" + response.key.id + "' successfully")
-        }, 3 * 1000)
-    })
+	const sendMessageWTyping = async(msg: AnyMessageContent, jid: string) => {
+		await sock.presenceSubscribe(jid)
+		await delay(500)
 
-    /* example of custom functionality for tracking battery */
-    conn.on('CB:action,,battery', json => {
-        const batteryLevelStr = json[2][0][1].value
-        const batterylevel = parseInt(batteryLevelStr)
-        console.log('battery level: ' + batterylevel)
-    })
-    conn.on('close', ({reason, isReconnecting}) => (
-        console.log ('oh no got disconnected: ' + reason + ', reconnecting: ' + isReconnecting)
-    ))
+		await sock.sendPresenceUpdate('composing', jid)
+		await delay(2000)
+
+		await sock.sendPresenceUpdate('paused', jid)
+
+		await sock.sendMessage(jid, msg)
+	}
+
+	// the process function lets you process all events that just occurred
+	// efficiently in a batch
+	sock.ev.process(
+		// events is a map for event name => event data
+		async(events) => {
+			// something about the connection changed
+			// maybe it closed, or we received all offline message or connection opened
+			if(events['connection.update']) {
+				const update = events['connection.update']
+				const { connection, lastDisconnect } = update
+				if(connection === 'close') {
+					// reconnect if not logged out
+					if((lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut) {
+						startSock()
+					} else {
+						console.log('Connection closed. You are logged out.')
+					}
+				}
+
+				console.log('connection update', update)
+			}
+
+			// credentials updated -- save them
+			if(events['creds.update']) {
+				await saveCreds()
+			}
+
+			if(events.call) {
+				console.log('recv call event', events.call)
+			}
+
+			// history received
+			if(events['messaging-history.set']) {
+				const { chats, contacts, messages, isLatest } = events['messaging-history.set']
+				console.log(`recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest})`)
+			}
+
+			// received a new message
+			if(events['messages.upsert']) {
+				const upsert = events['messages.upsert']
+				console.log('recv messages ', JSON.stringify(upsert, undefined, 2))
+
+				if(upsert.type === 'notify') {
+					for(const msg of upsert.messages) {
+						if(!msg.key.fromMe && doReplies) {
+							console.log('replying to', msg.key.remoteJid)
+							await sock!.readMessages([msg.key])
+							await sendMessageWTyping({ text: 'Hello there!' }, msg.key.remoteJid!)
+						}
+					}
+				}
+			}
+
+			// messages updated like status delivered, message deleted etc.
+			if(events['messages.update']) {
+				console.log(
+					JSON.stringify(events['messages.update'], undefined, 2)
+				)
+
+				for(const { key, update } of events['messages.update']) {
+					if(update.pollUpdates) {
+						const pollCreation = await getMessage(key)
+						if(pollCreation) {
+							console.log(
+								'got poll update, aggregation: ',
+								getAggregateVotesInPollMessage({
+									message: pollCreation,
+									pollUpdates: update.pollUpdates,
+								})
+							)
+						}
+					}
+				}
+			}
+
+			if(events['message-receipt.update']) {
+				console.log(events['message-receipt.update'])
+			}
+
+			if(events['messages.reaction']) {
+				console.log(events['messages.reaction'])
+			}
+
+			if(events['presence.update']) {
+				console.log(events['presence.update'])
+			}
+
+			if(events['chats.update']) {
+				console.log(events['chats.update'])
+			}
+
+			if(events['contacts.update']) {
+				for(const contact of events['contacts.update']) {
+					if(typeof contact.imgUrl !== 'undefined') {
+						const newUrl = contact.imgUrl === null
+							? null
+							: await sock!.profilePictureUrl(contact.id!).catch(() => null)
+						console.log(
+							`contact ${contact.id} has a new profile pic: ${newUrl}`,
+						)
+					}
+				}
+			}
+
+			if(events['chats.delete']) {
+				console.log('chats deleted ', events['chats.delete'])
+			}
+		}
+	)
+
+	return sock
+
+	async function getMessage(key: WAMessageKey): Promise<WAMessageContent | undefined> {
+		if(store) {
+			const msg = await store.loadMessage(key.remoteJid!, key.id!)
+			return msg?.message || undefined
+		}
+
+		// only if store is present
+		return proto.Message.fromObject({})
+	}
 }
 
-example().catch((err) => console.log(`encountered error: ${err}`))
+startSock()

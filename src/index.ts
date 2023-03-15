@@ -1,5 +1,12 @@
-export * from '../WAMessage/WAMessage'
-export * from './Binary/Constants'
-export * from './Binary/Decoder'
-export * from './Binary/Encoder'
-export * from './WAConnection'
+import makeWASocket from './Socket'
+
+export * from '../WAProto'
+export * from './Utils'
+export * from './Types'
+export * from './Store'
+export * from './Defaults'
+export * from './WABinary'
+
+export type WASocket = ReturnType<typeof makeWASocket>
+
+export default makeWASocket
